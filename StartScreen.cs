@@ -34,6 +34,21 @@ namespace Win8Charms
         public static readonly Color Ring = Color.FromArgb(0, 38, 94);       // faint bubbles
         public static readonly Color BarBack = Color.FromArgb(31, 31, 31);   // app bar
         public const int AutoGroupSize = 16;                                  // tiles per group on first run
+
+        public static readonly bool MonoIcons = true;     // force every icon to a white glyph on the flat tile colour
+        public const double IconDetail = 0.45;            // 0 = flat white silhouette, 1 = strong tonal detail inside the glyph
+
+        // tile colour presets shown in the Edit flyout (Metro palette)
+        public static readonly Color[] Swatches = new Color[]
+        {
+            Color.FromArgb(164, 196, 0),   Color.FromArgb(96, 169, 23),   Color.FromArgb(0, 138, 0),
+            Color.FromArgb(0, 171, 169),   Color.FromArgb(27, 161, 226),  Color.FromArgb(0, 80, 239),
+            Color.FromArgb(106, 0, 255),   Color.FromArgb(170, 0, 255),   Color.FromArgb(244, 114, 208),
+            Color.FromArgb(216, 0, 115),   Color.FromArgb(162, 0, 37),    Color.FromArgb(229, 20, 0),
+            Color.FromArgb(250, 104, 0),   Color.FromArgb(240, 163, 10),  Color.FromArgb(227, 200, 0),
+            Color.FromArgb(130, 90, 44),   Color.FromArgb(109, 135, 100), Color.FromArgb(100, 118, 135),
+            Color.FromArgb(118, 96, 138),  Color.FromArgb(135, 121, 78)
+        };
     }
 
     // ---------------------------------------------------------- shell COM interop ---
@@ -84,7 +99,8 @@ namespace Win8Charms
     class AppItem
     {
         public string Id = "", Name = "", Letter = "?";
-        public Bitmap Icon;
+        public Bitmap IconOrig;      // the icon exactly as Windows gives it
+        public Bitmap Glyph;         // forced white glyph on transparent background
         public Color Tint = Color.FromArgb(38, 114, 236);
         public bool Special;        // the built-in Desktop tile
     }
@@ -103,12 +119,25 @@ namespace Win8Charms
         public Rectangle R;         // page coordinates (before scrolling)
     }
 
+    class GroupRect
+    {
+        public int X0, X1;          // page x range of the tiles of this group
+        public Pin First;           // first pin of the group
+    }
+
     class PopItem
     {
         public string Text;
         public bool Enabled;
         public Action Run;
         public PopItem(string text, bool enabled, Action run) { Text = text; Enabled = enabled; Run = run; }
+    }
+
+    class EditItem
+    {
+        public Rectangle R;
+        public int Kind;            // 0 colour swatch, 1 custom colour, 2 reset, 3 icon style toggle
+        public Color C;
     }
 
     class BarBtn
@@ -127,19 +156,22 @@ namespace Win8Charms
         public static List<AppItem> Apps = new List<AppItem>();
 
         static readonly Dictionary<string, Bitmap> icons = new Dictionary<string, Bitmap>();
+        static readonly Dictionary<string, Bitmap> glyphs = new Dictionary<string, Bitmap>();
         static DateTime lastScan = DateTime.MinValue;
         static System.Threading.Thread worker;
 
+        // default tile colours: the Windows 8 / Metro palette
         static readonly Color[] Palette = new Color[]
         {
-            Color.FromArgb(38, 114, 236),   // blue
-            Color.FromArgb(0, 158, 40),     // green
-            Color.FromArgb(176, 30, 70),    // crimson
-            Color.FromArgb(217, 83, 41),    // orange
-            Color.FromArgb(95, 50, 170),    // purple
-            Color.FromArgb(105, 170, 18),   // lime
-            Color.FromArgb(0, 140, 150),    // teal
-            Color.FromArgb(190, 40, 60)     // red
+            Color.FromArgb(0, 138, 0),      // emerald
+            Color.FromArgb(140, 0, 149),    // purple
+            Color.FromArgb(81, 51, 171),    // indigo
+            Color.FromArgb(0, 130, 153),    // teal
+            Color.FromArgb(37, 114, 236),   // blue
+            Color.FromArgb(209, 69, 38),    // orange
+            Color.FromArgb(172, 25, 61),    // crimson
+            Color.FromArgb(255, 152, 0),    // amber
+            Color.FromArgb(13, 71, 170)     // cobalt
         };
 
         public static bool Stale { get { return (DateTime.UtcNow - lastScan).TotalMinutes > 5; } }
@@ -238,9 +270,13 @@ namespace Win8Charms
             for (int i = 0; i < name.Length; i++) h = h * 31 + name[i];
             a.Tint = Palette[(int)((uint)h % (uint)Palette.Length)];
 
-            Bitmap ic;
-            lock (Gate) { icons.TryGetValue(id, out ic); }
-            if (ic == null)
+            Bitmap orig, glyph;
+            lock (Gate)
+            {
+                icons.TryGetValue(id, out orig);
+                glyphs.TryGetValue(id, out glyph);
+            }
+            if (orig == null)
             {
                 try
                 {
@@ -248,20 +284,40 @@ namespace Win8Charms
                     if (f != null)
                     {
                         NSize sz;
-                        sz.cx = 96;
-                        sz.cy = 96;
+                        sz.cx = 192;
+                        sz.cy = 192;
                         IntPtr hbm;
-                        if (f.GetImage(sz, 0x4, out hbm) == 0 && hbm != IntPtr.Zero)   // SIIGBF_ICONONLY
+                        if (f.GetImage(sz, 0x104, out hbm) == 0 && hbm != IntPtr.Zero)   // SIIGBF_ICONONLY | SIIGBF_SCALEUP
                         {
-                            ic = FromHBitmap(hbm);
-                            if (ic != null) lock (Gate) { icons[id] = ic; }
+                            Bitmap big = FromHBitmap(hbm);
+                            if (big != null)
+                            {
+                                orig = Shrink(big, 96);
+                                glyph = Mono.Make(big, SCfg.IconDetail);
+                                big.Dispose();
+                                if (glyph == null) glyph = orig;
+                                lock (Gate) { icons[id] = orig; glyphs[id] = glyph; }
+                            }
                         }
                     }
                 }
                 catch { }
             }
-            a.Icon = ic;
+            a.IconOrig = orig;
+            a.Glyph = SCfg.MonoIcons ? glyph : orig;
             return a;
+        }
+
+        static Bitmap Shrink(Bitmap b, int size)
+        {
+            if (b.Width == size && b.Height == size) return new Bitmap(b);
+            Bitmap r = new Bitmap(size, size, PixelFormat.Format32bppArgb);
+            using (Graphics g = Graphics.FromImage(r))
+            {
+                g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                g.DrawImage(b, 0, 0, size, size);
+            }
+            return r;
         }
 
         // HBITMAP (32bpp with alpha) -> managed Bitmap that keeps its transparency
@@ -287,6 +343,147 @@ namespace Win8Charms
                 if (tmp != null) tmp.Dispose();
                 ShellApi.DeleteObject(hbm);
             }
+        }
+    }
+
+    // ------------------------------------------ icon -> flat white glyph (Metro style) ---
+    // 1) if the icon sits on an opaque coloured plate, the plate is keyed out
+    // 2) everything left becomes pure white; its transparency is kept
+    // 3) a little of the original brightness is kept as transparency so inner detail survives
+    // 4) the glyph is cropped and centred so every tile has a similar glyph size
+    static class Mono
+    {
+        public static Bitmap Make(Bitmap src, double detail)
+        {
+            int w = src.Width, h = src.Height;
+            if (w < 8 || h < 8) return null;
+            Rectangle full = new Rectangle(0, 0, w, h);
+
+            byte[] px;
+            int stride;
+            BitmapData sd = src.LockBits(full, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+            try
+            {
+                stride = sd.Stride;
+                if (stride <= 0) return null;
+                px = new byte[stride * h];
+                Marshal.Copy(sd.Scan0, px, 0, px.Length);
+            }
+            finally { src.UnlockBits(sd); }
+
+            // is there an opaque plate? look at the outer ring of pixels
+            int ring = Math.Max(1, Math.Min(w, h) / 48), cnt = 0, opaque = 0;
+            double bR = 0, bG = 0, bB = 0;
+            for (int y = 0; y < h; y++)
+            {
+                for (int x = 0; x < w; x++)
+                {
+                    if (x >= ring && x < w - ring && y >= ring && y < h - ring) continue;
+                    int i = y * stride + x * 4;
+                    cnt++;
+                    if (px[i + 3] >= 235) { opaque++; bB += px[i]; bG += px[i + 1]; bR += px[i + 2]; }
+                }
+            }
+            bool plated = cnt > 0 && opaque >= cnt * 0.85;
+            if (plated) { bR /= opaque; bG /= opaque; bB /= opaque; }
+
+            // alpha (plate removed) + luminance
+            int n = w * h;
+            double[] al = new double[n];
+            double[] lu = new double[n];
+            int[] hist = new int[64];
+            int hn = 0;
+            for (int y = 0; y < h; y++)
+            {
+                for (int x = 0; x < w; x++)
+                {
+                    int i = y * stride + x * 4, j = y * w + x;
+                    double a = px[i + 3] / 255.0, rr = px[i + 2], gg = px[i + 1], bl = px[i];
+                    if (plated)
+                    {
+                        double dr = rr - bR, dg = gg - bG, db = bl - bB;
+                        double k = (Math.Sqrt(dr * dr + dg * dg + db * db) - 28.0) / 72.0;
+                        a *= k < 0 ? 0 : (k > 1 ? 1 : k);
+                    }
+                    al[j] = a;
+                    lu[j] = (0.2126 * rr + 0.7152 * gg + 0.0722 * bl) / 255.0;
+                    if (a > 0.5) { hist[(int)(lu[j] * 63.0)]++; hn++; }
+                }
+            }
+            if (hn < n / 200) return null;       // nothing usable left
+
+            // 5%..95% luminance range of the glyph
+            double lo = 0.0, hi = 1.0;
+            int acc = 0;
+            bool gotLo = false;
+            for (int bin = 0; bin < 64; bin++)
+            {
+                acc += hist[bin];
+                if (!gotLo && acc >= hn * 0.05) { lo = bin / 63.0; gotLo = true; }
+                if (acc >= hn * 0.95) { hi = bin / 63.0; break; }
+            }
+            double span = hi - lo;
+            bool shade = detail > 0.0 && span > 0.08;
+
+            // white pixels, transparency only
+            byte[] ob = new byte[stride * h];
+            int minX = w, minY = h, maxX = -1, maxY = -1;
+            for (int y = 0; y < h; y++)
+            {
+                for (int x = 0; x < w; x++)
+                {
+                    int j = y * w + x;
+                    double oa = al[j];
+                    if (shade)
+                    {
+                        double ln = (lu[j] - lo) / span;
+                        ln = ln < 0 ? 0 : (ln > 1 ? 1 : ln);
+                        oa *= (1.0 - detail) + detail * ln;
+                    }
+                    if (oa < 0.04) continue;
+                    int i = y * stride + x * 4;
+                    ob[i] = 255;
+                    ob[i + 1] = 255;
+                    ob[i + 2] = 255;
+                    ob[i + 3] = (byte)(oa * 255.0 + 0.5);
+                    if (oa > 0.12)
+                    {
+                        if (x < minX) minX = x;
+                        if (x > maxX) maxX = x;
+                        if (y < minY) minY = y;
+                        if (y > maxY) maxY = y;
+                    }
+                }
+            }
+            if (maxX < 0) return null;
+
+            Bitmap tmp = new Bitmap(w, h, PixelFormat.Format32bppArgb);
+            BitmapData td = tmp.LockBits(full, ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+            try
+            {
+                for (int y = 0; y < h; y++)
+                    Marshal.Copy(ob, y * stride, new IntPtr(td.Scan0.ToInt64() + (long)y * td.Stride), w * 4);
+            }
+            finally { tmp.UnlockBits(td); }
+
+            // crop to the glyph and centre it on a 96x96 canvas
+            const int OUT = 96;
+            int bw = maxX - minX + 1, bh = maxY - minY + 1;
+            Bitmap dst = new Bitmap(OUT, OUT, PixelFormat.Format32bppArgb);
+            using (Graphics g = Graphics.FromImage(dst))
+            {
+                g.Clear(Color.Transparent);
+                g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                float box = OUT - 12f;
+                float sc = Math.Min(box / bw, box / bh);
+                if (sc > 1.5f) sc = 1.5f;
+                float dw = bw * sc, dh = bh * sc;
+                g.DrawImage(tmp, new RectangleF((OUT - dw) / 2f, (OUT - dh) / 2f, dw, dh),
+                    new RectangleF(minX, minY, bw, bh), GraphicsUnit.Pixel);
+            }
+            tmp.Dispose();
+            return dst;
         }
     }
 
@@ -467,6 +664,8 @@ namespace Win8Charms
     {
         public static readonly List<Pin> Pins = new List<Pin>();
         static readonly HashSet<string> known = new HashSet<string>();
+        static readonly Dictionary<string, int> colors = new Dictionary<string, int>();     // custom tile colours (ARGB)
+        static readonly HashSet<string> originals = new HashSet<string>();                  // tiles that keep their original icon colours
 
         static string FilePath
         {
@@ -477,6 +676,8 @@ namespace Win8Charms
         {
             Pins.Clear();
             known.Clear();
+            colors.Clear();
+            originals.Clear();
             try
             {
                 if (!File.Exists(FilePath)) return;
@@ -494,6 +695,12 @@ namespace Win8Charms
                         Pins.Add(p);
                     }
                     else if (f.Length >= 2 && f[0] == "K") known.Add(f[1]);
+                    else if (f.Length >= 3 && f[0] == "C")
+                    {
+                        int cv;
+                        if (int.TryParse(f[2], out cv)) colors[f[1]] = cv;
+                    }
+                    else if (f.Length >= 2 && f[0] == "O") originals.Add(f[1]);
                 }
             }
             catch { }
@@ -508,6 +715,8 @@ namespace Win8Charms
                 List<string> lines = new List<string>();
                 foreach (Pin p in Pins) lines.Add("P\t" + p.Id + "\t" + p.Size + "\t" + p.Group);
                 foreach (string k in known) lines.Add("K\t" + k);
+                foreach (KeyValuePair<string, int> kv in colors) lines.Add("C\t" + kv.Key + "\t" + kv.Value);
+                foreach (string o in originals) lines.Add("O\t" + o);
                 File.WriteAllLines(path, lines.ToArray());
             }
             catch { }
@@ -549,7 +758,7 @@ namespace Win8Charms
             {
                 int g = Pins[Pins.Count - 1].Group, n = 0;
                 foreach (Pin q in Pins) if (q.Group == g) n++;
-                p.Group = n >= SCfg.AutoGroupSize ? g + 1 : g;
+                p.Group = n >= SCfg.AutoGroupSize ? NewGroupId() : g;
             }
             Pins.Add(p);
         }
@@ -563,6 +772,43 @@ namespace Win8Charms
         public static void Add(string id) { if (!IsPinned(id)) AddPin(id); }
 
         public static void Unpin(string id) { Pins.RemoveAll(delegate(Pin p) { return p.Id == id; }); }
+
+        // ----- per-tile appearance -----
+        public static Color TileColor(AppItem a)
+        {
+            int v;
+            return colors.TryGetValue(a.Id, out v) ? Color.FromArgb(v) : a.Tint;
+        }
+
+        public static void SetColor(string id, Color c) { colors[id] = Color.FromArgb(255, c).ToArgb(); }
+        public static void ClearColor(string id) { colors.Remove(id); }
+        public static bool UseOriginal(string id) { return originals.Contains(id); }
+        public static void ToggleOriginal(string id) { if (!originals.Remove(id)) originals.Add(id); }
+        public static void SetOriginal(string id, bool on) { if (on) originals.Add(id); else originals.Remove(id); }
+
+        public static int NewGroupId()
+        {
+            int m = -1;
+            foreach (Pin q in Pins) if (q.Group > m) m = q.Group;
+            return m + 1;
+        }
+
+        // put the tile into a brand new group in front of 'beforeFirst' (null = after the last group)
+        public static void MoveToNewGroup(Pin p, Pin beforeFirst)
+        {
+            Pin anchor = beforeFirst;
+            if (anchor == p)
+            {
+                int k = Pins.IndexOf(p);
+                anchor = (k >= 0 && k + 1 < Pins.Count) ? Pins[k + 1] : null;
+            }
+            int g = NewGroupId();
+            Pins.Remove(p);
+            int i = (anchor == null) ? Pins.Count : Pins.IndexOf(anchor);
+            if (i < 0) i = Pins.Count;
+            p.Group = g;
+            Pins.Insert(i, p);
+        }
 
         public static void Move(Pin p, Pin before)
         {
@@ -620,7 +866,7 @@ namespace Win8Charms
     class StartForm : Form
     {
         const TextFormatFlags TF = TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix | TextFormatFlags.Left | TextFormatFlags.Top;
-        const int HDR_NONE = 0, HDR_AVATAR = 1, HDR_POWER = 2, HDR_SEARCH = 3, HDR_TOGGLE = 4;
+        const int HDR_NONE = 0, HDR_AVATAR = 1, HDR_POWER = 2, HDR_TOGGLE = 4;
 
         // decorative bubbles, reference size 1366x768: cx, cy, radius, stroke
         static readonly float[][] Rings = new float[][]
@@ -643,7 +889,13 @@ namespace Win8Charms
         readonly Dictionary<string, AppItem> byId = new Dictionary<string, AppItem>();
         readonly List<Cell> cells = new List<Cell>();
         readonly List<BarBtn> bars = new List<BarBtn>();
-        Cell hover, selected, pressCell, dropTarget;
+        Cell hover, pressCell, dropTarget;
+        readonly List<GroupRect> groups = new List<GroupRect>();
+        int groupGap;
+        bool slotOn;                // dragging a tile over empty space -> a new group would be created here
+        Pin slotBefore;             // the new group goes in front of the group starting with this pin (null = at the end)
+        int slotX;                  // page x of the drop marker
+        readonly HashSet<string> sel = new HashSet<string>();      // selected app ids (multi-select)
         Point pressPt, dragPt, dragOff;
         bool dragging, panning, thumbDrag;
         int panX, thumbGrab, barPress = -1, hdrPress, barHover = -1;
@@ -651,11 +903,16 @@ namespace Win8Charms
 
         string name1 = "", name2 = "";
         Bitmap avatar, bg, wall;
-        Rectangle rcAvatar, rcPower, rcSearch, rcToggle, rcThumb;
+        Rectangle rcAvatar, rcPower, rcToggle, rcThumb;
 
         List<PopItem> menu;
         Rectangle rcMenu;
         int menuHover = -1, menuItemH;
+
+        bool editOpen, modal;
+        Rectangle rcEdit;
+        int editHover = -1, editPad;
+        readonly List<EditItem> editItems = new List<EditItem>();
 
         Font fTitle, fName1, fName2, fTile, fLetter, fMenu, fBar, fItem;
         readonly Timer anim;
@@ -715,7 +972,7 @@ namespace Win8Charms
             BuildBackground();
 
             allMode = false;
-            selected = null;
+            sel.Clear();
             hover = null;
             menu = null;
             barT = 0;
@@ -744,6 +1001,7 @@ namespace Win8Charms
             closing = true;
             opT = 0;
             menu = null;
+            editOpen = false;
             barTarget = 0;
             StartAnim();
         }
@@ -753,10 +1011,12 @@ namespace Win8Charms
             Hide();
             shown = false;
             closing = false;
-            selected = null;
+            sel.Clear();
             hover = null;
             menu = null;
+            editOpen = false;
             dragging = false;
+            slotOn = false;
             panning = false;
             pressCell = null;
             cells.Clear();
@@ -775,7 +1035,7 @@ namespace Win8Charms
         protected override void OnDeactivate(EventArgs e)
         {
             base.OnDeactivate(e);
-            if (activated && shown && !closing) Dismiss();      // e.g. the normal Start menu or another app took focus
+            if (activated && shown && !closing && !modal) Dismiss();      // e.g. the normal Start menu or another app took focus
         }
 
         protected override void OnFormClosing(FormClosingEventArgs e)
@@ -810,8 +1070,7 @@ namespace Win8Charms
             avatar = UserInfo.Avatar((int)Math.Round(80 * S));
 
             int m = (int)Math.Round(46 * S), ico = (int)Math.Round(24 * S), cy = (int)Math.Round(80 * S);
-            rcSearch = new Rectangle(W - m - ico, cy - ico / 2, ico, ico);
-            rcPower = new Rectangle(rcSearch.Left - (int)Math.Round(36 * S) - ico, cy - ico / 2, ico, ico);
+            rcPower = new Rectangle(W - m - ico, cy - ico / 2, ico, ico);      // power button sits at the right margin
             int av = (int)Math.Round(40 * S);
             rcAvatar = new Rectangle(rcPower.Left - (int)Math.Round(29 * S) - av, cy - av / 2, av, av);
             int bt = (int)Math.Round(32 * S);
@@ -876,8 +1135,8 @@ namespace Win8Charms
 
         void Relayout()
         {
-            string selId = selected != null ? selected.App.Id : null;
             cells.Clear();
+            groups.Clear();
             hover = null;
             int left = (int)Math.Round(120 * S);
             tilesTop = (int)Math.Round(184 * S);
@@ -889,16 +1148,25 @@ namespace Win8Charms
                 int halfRows = rows * 2;
                 List<bool[]> occ = null;
                 int curGroup = int.MinValue, groupX = left, endX = left;
-                int groupGap = (int)Math.Round(56 * S);
+                groupGap = (int)Math.Round(56 * S);
                 foreach (Pin p in PinStore.Pins)
                 {
                     AppItem a;
                     if (!byId.TryGetValue(p.Id, out a)) continue;
                     if (occ == null || p.Group != curGroup)
                     {
-                        if (occ != null) groupX = groupX + occ.Count * pitch - gap + groupGap;
+                        if (occ != null)
+                        {
+                            groups[groups.Count - 1].X1 = groupX + occ.Count * pitch - gap;
+                            groupX = groupX + occ.Count * pitch - gap + groupGap;
+                        }
                         occ = new List<bool[]>();
                         curGroup = p.Group;
+                        GroupRect gro = new GroupRect();
+                        gro.X0 = groupX;
+                        gro.X1 = groupX;
+                        gro.First = p;
+                        groups.Add(gro);
                     }
                     int w, h, c, r;
                     UnitSize(p.Size, out w, out h);
@@ -910,6 +1178,7 @@ namespace Win8Charms
                     cells.Add(cell);
                     endX = groupX + occ.Count * pitch - gap;
                 }
+                if (occ != null) groups[groups.Count - 1].X1 = groupX + occ.Count * pitch - gap;
                 contentW = endX + left;
             }
             else
@@ -935,12 +1204,13 @@ namespace Win8Charms
             scrollT = Math.Max(0, Math.Min(maxScroll, scrollT));
             scrollX = Math.Max(0, Math.Min(maxScroll, scrollX));
 
-            selected = null;
-            if (selId != null)
+            if (sel.Count > 0)
             {
-                foreach (Cell c2 in cells) if (c2.App.Id == selId) { selected = c2; break; }
+                HashSet<string> present = new HashSet<string>();
+                foreach (Cell c2 in cells) present.Add(c2.App.Id);
+                sel.RemoveWhere(delegate(string sid) { return !present.Contains(sid); });
             }
-            if (selected != null) BuildBar();
+            if (sel.Count > 0) BuildBar();
             else if (barTarget > 0) { barTarget = 0; StartAnim(); }
         }
 
@@ -950,6 +1220,48 @@ namespace Win8Charms
             for (int i = 0; i < cells.Count; i++)
                 if (cells[i].R.Contains(px, p.Y)) return cells[i];
             return null;
+        }
+
+        // dragging over empty space: in the gap between two groups, before the first group or after the
+        // last one a new group is created there (like Windows 8)
+        void ComputeSlot(Point p)
+        {
+            slotOn = false;
+            if (allMode) return;
+            if (p.Y < tilesTop - (int)Math.Round(60 * S)) return;
+            int px = p.X + (int)Math.Round(scrollX);
+            if (groups.Count == 0)
+            {
+                slotOn = true;
+                slotBefore = null;
+                slotX = (int)Math.Round(120 * S);
+                return;
+            }
+            GroupRect first = groups[0], last = groups[groups.Count - 1];
+            if (px < first.X0)
+            {
+                slotOn = true;
+                slotBefore = first.First;
+                slotX = first.X0 - groupGap / 2;
+                return;
+            }
+            if (px >= last.X1)
+            {
+                slotOn = true;
+                slotBefore = null;
+                slotX = last.X1 + groupGap / 2;
+                return;
+            }
+            for (int gi = 0; gi + 1 < groups.Count; gi++)
+            {
+                if (px >= groups[gi].X1 && px < groups[gi + 1].X0)
+                {
+                    slotOn = true;
+                    slotBefore = groups[gi + 1].First;
+                    slotX = (groups[gi].X1 + groups[gi + 1].X0) / 2;
+                    return;
+                }
+            }
         }
 
         void InvalidateCell(Cell c)
@@ -1017,6 +1329,14 @@ namespace Win8Charms
             g.DrawImage(im, new RectangleF(d.X, d.Y, d.Width, d.Height), src, GraphicsUnit.Pixel);
         }
 
+        // white glyph by default, original colours if the user switched that tile in the Edit flyout
+        static Bitmap IconFor(AppItem a)
+        {
+            Bitmap b = PinStore.UseOriginal(a.Id) ? a.IconOrig : a.Glyph;
+            if (b == null) b = (a.Glyph != null) ? a.Glyph : a.IconOrig;
+            return b;
+        }
+
         protected override void OnPaint(PaintEventArgs e)
         {
             Graphics g = e.Graphics;
@@ -1051,6 +1371,15 @@ namespace Win8Charms
                         g.DrawRectangle(p, t.X, t.Y, t.Width - 1, t.Height - 1);
                     }
                 }
+                if (slotOn)
+                {
+                    int mtop = tilesTop, mhgt = rows * 2 * pitch - gap, mx = slotX - sx;
+                    int pad6 = (int)Math.Round(6 * S);
+                    using (Brush wb = new SolidBrush(Color.FromArgb(34, 255, 255, 255)))
+                        g.FillRectangle(wb, mx - (groupGap - 2 * pad6) / 2, mtop, groupGap - 2 * pad6, mhgt);
+                    using (Brush nb = new SolidBrush(Color.FromArgb(230, 255, 255, 255)))
+                        g.FillRectangle(nb, mx - (int)Math.Round(3 * S), mtop, Math.Max(3, pad6), mhgt);
+                }
                 Rectangle gr = new Rectangle(dragPt.X - dragOff.X, dragPt.Y - dragOff.Y, pressCell.R.Width, pressCell.R.Height);
                 DrawTile(g, pressCell, gr, false);
             }
@@ -1058,6 +1387,7 @@ namespace Win8Charms
             DrawToggle(g);
             DrawScrollbar(g);
             DrawBar(g);
+            DrawEdit(g);
             DrawMenu(g);
         }
 
@@ -1095,8 +1425,6 @@ namespace Win8Charms
                 g.DrawArc(p, cx - rad, cy - rad, 2 * rad, 2 * rad, 305f, 290f);
                 g.DrawLine(p, cx, cy - rad * 1.15f, cx, cy - rad * 0.1f);
             }
-            // search icon
-            Icons.Search(g, rcSearch.X, rcSearch.Y, rcSearch.Width, Color.White);
         }
 
         void DrawDefaultAvatar(Graphics g, Rectangle r)
@@ -1172,15 +1500,16 @@ namespace Win8Charms
             AppItem a = c.App;
             int kind = c.Pin != null ? c.Pin.Size : 1;
             if (pressed) r.Inflate(-(int)Math.Round(3 * S), -(int)Math.Round(3 * S));
-            using (Brush b = new SolidBrush(a.Tint)) g.FillRectangle(b, r);
+            using (Brush b = new SolidBrush(PinStore.TileColor(a))) g.FillRectangle(b, r);
 
             if (a.Special && wall != null) DrawCover(g, wall, r);
             else
             {
-                int isz = (int)Math.Round((kind == 0 ? 30 : (kind == 3 ? 84 : 52)) * S);
+                int isz = (int)Math.Round((kind == 0 ? 32 : (kind == 3 ? 100 : 60)) * S);
                 int dy = kind == 0 ? 0 : (int)Math.Round(8 * S);
-                if (a.Icon != null)
-                    g.DrawImage(a.Icon, new Rectangle(r.X + (r.Width - isz) / 2, r.Y + (r.Height - isz) / 2 - dy, isz, isz));
+                Bitmap ico = IconFor(a);
+                if (ico != null)
+                    g.DrawImage(ico, new Rectangle(r.X + (r.Width - isz) / 2, r.Y + (r.Height - isz) / 2 - dy, isz, isz));
                 else
                     TextRenderer.DrawText(g, a.Letter, fLetter, new Rectangle(r.X, r.Y - dy, r.Width, r.Height), Color.White,
                         TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
@@ -1191,7 +1520,7 @@ namespace Win8Charms
                 TextRenderer.DrawText(g, a.Name, fTile, lr, Color.White,
                     TextFormatFlags.Left | TextFormatFlags.Top | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
             }
-            if (c == hover && !pressed && selected != c)
+            if (c == hover && !pressed && !sel.Contains(c.App.Id))
             {
                 using (Pen p = new Pen(Color.FromArgb(120, 255, 255, 255), Math.Max(2f, 2 * S)))
                 {
@@ -1199,21 +1528,22 @@ namespace Win8Charms
                     g.DrawRectangle(p, r.X, r.Y, r.Width - 1, r.Height - 1);
                 }
             }
-            if (c == selected) DrawSelected(g, r);
+            if (sel.Contains(c.App.Id)) DrawSelected(g, r);
         }
 
         void DrawListItem(Graphics g, Cell c, Rectangle r)
         {
             bool hov = (c == hover);
-            if (hov || c == selected)
+            if (hov || sel.Contains(c.App.Id))
                 using (Brush hb = new SolidBrush(Color.FromArgb(hov ? 46 : 30, 255, 255, 255))) g.FillRectangle(hb, r);
 
             int ts = r.Height - (int)Math.Round(8 * S);
             Rectangle tr = new Rectangle(r.X + (int)Math.Round(4 * S), r.Y + (r.Height - ts) / 2, ts, ts);
-            using (Brush tb = new SolidBrush(c.App.Tint)) g.FillRectangle(tb, tr);
-            int isz = (int)Math.Round(30 * S);
-            if (c.App.Icon != null)
-                g.DrawImage(c.App.Icon, new Rectangle(tr.X + (ts - isz) / 2, tr.Y + (ts - isz) / 2, isz, isz));
+            using (Brush tb = new SolidBrush(PinStore.TileColor(c.App))) g.FillRectangle(tb, tr);
+            int isz = (int)Math.Round(36 * S);
+            Bitmap lico = IconFor(c.App);
+            if (lico != null)
+                g.DrawImage(lico, new Rectangle(tr.X + (ts - isz) / 2, tr.Y + (ts - isz) / 2, isz, isz));
             else
                 TextRenderer.DrawText(g, c.App.Letter, fMenu, tr, Color.White,
                     TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
@@ -1221,7 +1551,7 @@ namespace Win8Charms
             int tx = tr.Right + (int)Math.Round(12 * S);
             TextRenderer.DrawText(g, c.App.Name, fItem, new Rectangle(tx, r.Y, r.Right - tx - (int)Math.Round(6 * S), r.Height), Color.White,
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
-            if (c == selected) DrawSelected(g, r);
+            if (sel.Contains(c.App.Id)) DrawSelected(g, r);
         }
 
         // ---------------------------------------------------------------- app bar ---
@@ -1236,7 +1566,7 @@ namespace Win8Charms
             return -1;
         }
 
-        void AddBar(string text, int kind, ref int x, int w, int y, Action run)
+        BarBtn AddBar(string text, int kind, ref int x, int w, int y, Action run)
         {
             BarBtn b = new BarBtn();
             b.Text = text;
@@ -1245,65 +1575,119 @@ namespace Win8Charms
             b.Run = run;
             bars.Add(b);
             x += w + (int)Math.Round(6 * S);
+            return b;
+        }
+
+        Pin PinOf(string id)
+        {
+            foreach (Pin pn in PinStore.Pins) if (pn.Id == id) return pn;
+            return null;
+        }
+
+        // the one selected app - null when nothing or several tiles are selected
+        AppItem SelApp()
+        {
+            if (sel.Count != 1) return null;
+            foreach (string sid in sel)
+            {
+                AppItem a;
+                if (byId.TryGetValue(sid, out a)) return a;
+            }
+            return null;
         }
 
         void BuildBar()
         {
             bars.Clear();
-            if (selected == null) return;
+            if (sel.Count == 0) return;
             int x = (int)Math.Round(46 * S), w = (int)Math.Round(124 * S), y = H - barH;
-            string id = selected.App.Id;
+            List<string> ids = new List<string>(sel);
+            bool single = ids.Count == 1;
+
             if (!allMode)
             {
-                Pin pin = selected.Pin;
+                // Unpin works on every selected tile
                 AddBar("Unpin from Start", 0, ref x, w, y, delegate
                 {
-                    PinStore.Unpin(id);
+                    for (int k = 0; k < ids.Count; k++) PinStore.Unpin(ids[k]);
                     PinStore.Save();
-                    selected = null;
+                    sel.Clear();
+                    editOpen = false;
                     barTarget = 0;
                     StartAnim();
                     Relayout();
                     Invalidate();
                 });
-                if (pin.Size < 3)
-                    AddBar("Larger", 1, ref x, w, y, delegate { pin.Size++; PinStore.Save(); Relayout(); Invalidate(); });
-                if (pin.Size > 0)
-                    AddBar("Smaller", 2, ref x, w, y, delegate { pin.Size--; PinStore.Save(); Relayout(); Invalidate(); });
-            }
-            else if (PinStore.IsPinned(id))
-            {
-                AddBar("Unpin from Start", 0, ref x, w, y, delegate
+                // Larger / Smaller only make sense for one tile
+                if (single)
                 {
-                    PinStore.Unpin(id);
-                    PinStore.Save();
-                    Deselect();
-                });
+                    Pin pin = PinOf(ids[0]);
+                    if (pin != null && pin.Size < 3)
+                        AddBar("Larger", 1, ref x, w, y, delegate { pin.Size++; PinStore.Save(); Relayout(); Invalidate(); });
+                    if (pin != null && pin.Size > 0)
+                        AddBar("Smaller", 2, ref x, w, y, delegate { pin.Size--; PinStore.Save(); Relayout(); Invalidate(); });
+                    if (pin != null)
+                        AddBar("New group", 5, ref x, w, y, delegate
+                        {
+                            PinStore.MoveToNewGroup(pin, null);     // new section after the last one
+                            PinStore.Save();
+                            sel.Clear();
+                            editOpen = false;
+                            barTarget = 0;
+                            StartAnim();
+                            Relayout();
+                            Invalidate();
+                        });
+                }
             }
             else
             {
-                AddBar("Pin to Start", 3, ref x, w, y, delegate
+                bool anyPinned = false, anyFree = false;
+                for (int q = 0; q < ids.Count; q++)
                 {
-                    PinStore.Add(id);
-                    PinStore.Save();
-                    Deselect();
-                });
+                    if (PinStore.IsPinned(ids[q])) anyPinned = true; else anyFree = true;
+                }
+                if (anyFree)
+                    AddBar("Pin to Start", 3, ref x, w, y, delegate
+                    {
+                        for (int k = 0; k < ids.Count; k++) PinStore.Add(ids[k]);
+                        PinStore.Save();
+                        Deselect();
+                    });
+                if (anyPinned)
+                    AddBar("Unpin from Start", 0, ref x, w, y, delegate
+                    {
+                        for (int k = 0; k < ids.Count; k++) PinStore.Unpin(ids[k]);
+                        PinStore.Save();
+                        Deselect();
+                    });
+            }
+
+            // Edit (colour / icon style) is for a single tile only
+            if (single)
+            {
+                BarBtn eb = AddBar("Edit", 4, ref x, w, y, null);
+                eb.Run = delegate { ToggleEdit(eb); };
             }
         }
 
-        void SelectCell(Cell c)
+        // add the tile to / remove it from the selection
+        void ToggleSel(Cell c)
         {
-            selected = c;
-            BuildBar();
-            barTarget = 1;
+            string id = c.App.Id;
+            if (!sel.Remove(id)) sel.Add(id);
+            editOpen = false;
+            if (sel.Count > 0) { BuildBar(); barTarget = 1; }
+            else barTarget = 0;
             StartAnim();
             Invalidate();
         }
 
         void Deselect()
         {
-            if (selected == null && barTarget == 0) return;
-            selected = null;
+            if (sel.Count == 0 && barTarget == 0) return;
+            editOpen = false;
+            sel.Clear();
             barTarget = 0;
             StartAnim();
             Invalidate();
@@ -1328,6 +1712,20 @@ namespace Win8Charms
                     g.DrawLine(p, cx - 7 * u, cy + 7 * u, cx + 7 * u, cy - 7 * u);
                     g.DrawLine(p, cx + 7 * u, cy - 7 * u, cx + 7 * u, cy - 1 * u);
                     g.DrawLine(p, cx + 7 * u, cy - 7 * u, cx + 1 * u, cy - 7 * u);
+                }
+                else if (kind == 5)        // new group: plus
+                {
+                    g.DrawLine(p, cx - 8 * u, cy, cx + 8 * u, cy);
+                    g.DrawLine(p, cx, cy - 8 * u, cx, cy + 8 * u);
+                }
+                else if (kind == 4)        // edit: pencil
+                {
+                    float k = 0.7071f * 2.6f * u;
+                    PointF a1 = new PointF(cx - 4 * u + k, cy + 4 * u + k), a2 = new PointF(cx - 4 * u - k, cy + 4 * u - k);
+                    PointF b1 = new PointF(cx + 7 * u + k, cy - 7 * u + k), b2 = new PointF(cx + 7 * u - k, cy - 7 * u - k);
+                    PointF tip = new PointF(cx - 9 * u, cy + 9 * u);
+                    g.DrawPolygon(p, new PointF[] { a1, b1, b2, a2 });
+                    g.DrawLines(p, new PointF[] { a1, tip, a2 });
                 }
                 else                       // smaller: arrow pointing in to the bottom-left
                 {
@@ -1359,6 +1757,177 @@ namespace Win8Charms
                     TextFormatFlags.HorizontalCenter | TextFormatFlags.Top | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
             }
             g.SmoothingMode = old;
+        }
+
+        // -------------------------------------------------------------- edit flyout ---
+        void AddEdit(int kind, Rectangle r)
+        {
+            EditItem it = new EditItem();
+            it.Kind = kind;
+            it.R = r;
+            editItems.Add(it);
+        }
+
+        void ToggleEdit(BarBtn b)
+        {
+            if (editOpen) { CloseEdit(); return; }
+            if (SelApp() == null) return;
+            BuildEdit(b.R.X);
+            editOpen = true;
+            Invalidate();
+        }
+
+        void CloseEdit()
+        {
+            if (!editOpen) return;
+            editOpen = false;
+            editHover = -1;
+            Invalidate();
+        }
+
+        void BuildEdit(int anchorX)
+        {
+            editItems.Clear();
+            int cols = 7;
+            editPad = (int)Math.Round(16 * S);
+            int sw = (int)Math.Round(34 * S), sg = (int)Math.Round(6 * S);
+            int gridW = cols * sw + (cols - 1) * sg;
+            int w = gridW + 2 * editPad;
+            int titleH = (int)Math.Round(30 * S);
+            int total = SCfg.Swatches.Length + 1;                       // +1: the Windows accent colour
+            int rowsN = (total + cols - 1) / cols;
+            int gridH = rowsN * sw + (rowsN - 1) * sg;
+            int btnH = (int)Math.Round(32 * S), rowGap = (int)Math.Round(8 * S);
+            int h = editPad + titleH + gridH + (int)Math.Round(14 * S) + btnH + rowGap + btnH + editPad;
+            int margin = (int)Math.Round(8 * S);
+            int x = Math.Max(margin, Math.Min(anchorX, W - w - margin));
+            int y = H - barH - h - margin;
+            rcEdit = new Rectangle(x, y, w, h);
+
+            int gx = x + editPad, gy = y + editPad + titleH;
+            for (int i = 0; i < total; i++)
+            {
+                EditItem it = new EditItem();
+                it.Kind = 0;
+                it.C = (i == 0) ? Sys.Accent() : SCfg.Swatches[i - 1];
+                it.R = new Rectangle(gx + (i % cols) * (sw + sg), gy + (i / cols) * (sw + sg), sw, sw);
+                editItems.Add(it);
+            }
+            int by = gy + gridH + (int)Math.Round(14 * S);
+            int bw = (gridW - sg) / 2;
+            AddEdit(1, new Rectangle(gx, by, bw, btnH));
+            AddEdit(2, new Rectangle(gx + bw + sg, by, bw, btnH));
+            AddEdit(3, new Rectangle(gx, by + btnH + rowGap, gridW, btnH));
+            editHover = -1;
+        }
+
+        int EditHit(Point p)
+        {
+            if (!editOpen || !rcEdit.Contains(p)) return -1;
+            for (int i = 0; i < editItems.Count; i++)
+                if (editItems[i].R.Contains(p)) return i;
+            return -1;
+        }
+
+        void EditClick(int idx)
+        {
+            AppItem sa = SelApp();
+            if (idx < 0 || idx >= editItems.Count || sa == null) return;
+            EditItem it = editItems[idx];
+            string id = sa.Id;
+            switch (it.Kind)
+            {
+                case 0:
+                    PinStore.SetColor(id, it.C);
+                    PinStore.Save();
+                    Invalidate();
+                    break;
+                case 1:
+                    PickCustom();
+                    break;
+                case 2:
+                    PinStore.ClearColor(id);
+                    PinStore.SetOriginal(id, false);
+                    PinStore.Save();
+                    Invalidate();
+                    break;
+                case 3:
+                    PinStore.ToggleOriginal(id);
+                    PinStore.Save();
+                    Invalidate();
+                    break;
+            }
+        }
+
+        // the standard Windows colour dialog for any colour you like
+        void PickCustom()
+        {
+            AppItem a = SelApp();
+            if (a == null) return;
+            modal = true;               // the dialog takes focus - don't close the Start screen because of it
+            try
+            {
+                using (ColorDialog cd = new ColorDialog())
+                {
+                    cd.AnyColor = true;
+                    cd.FullOpen = true;
+                    cd.Color = PinStore.TileColor(a);
+                    if (cd.ShowDialog(this) == DialogResult.OK)
+                    {
+                        PinStore.SetColor(a.Id, cd.Color);
+                        PinStore.Save();
+                    }
+                }
+            }
+            finally { modal = false; }
+            ShellApi.SetForegroundWindow(Handle);
+            Invalidate();
+        }
+
+        void DrawEdit(Graphics g)
+        {
+            if (!editOpen) return;
+            using (Brush b = new SolidBrush(Color.FromArgb(38, 38, 38))) g.FillRectangle(b, rcEdit);
+            using (Pen bp = new Pen(Color.FromArgb(100, 100, 100), Math.Max(1f, S)))
+            {
+                bp.Alignment = PenAlignment.Inset;
+                g.DrawRectangle(bp, rcEdit.X, rcEdit.Y, rcEdit.Width - 1, rcEdit.Height - 1);
+            }
+            TextRenderer.DrawText(g, "Tile color", fBar, new Point(rcEdit.X + editPad, rcEdit.Y + (int)Math.Round(14 * S)), Color.White, TF);
+
+            AppItem sa = SelApp();
+            int cur = sa != null ? PinStore.TileColor(sa).ToArgb() : 0;
+            bool orig = sa != null && PinStore.UseOriginal(sa.Id);
+            for (int i = 0; i < editItems.Count; i++)
+            {
+                EditItem it = editItems[i];
+                bool hov = (i == editHover);
+                if (it.Kind == 0)
+                {
+                    using (Brush sb = new SolidBrush(it.C)) g.FillRectangle(sb, it.R);
+                    bool isCur = Color.FromArgb(255, it.C).ToArgb() == cur;
+                    if (isCur || hov)
+                    {
+                        using (Pen p = new Pen(isCur ? Color.White : Color.FromArgb(170, 255, 255, 255), Math.Max(2f, 2 * S)))
+                        {
+                            p.Alignment = PenAlignment.Inset;
+                            g.DrawRectangle(p, it.R.X, it.R.Y, it.R.Width - 1, it.R.Height - 1);
+                        }
+                    }
+                }
+                else
+                {
+                    string label = it.Kind == 1 ? "Custom color..." : (it.Kind == 2 ? "Reset" : (orig ? "Icon: original colors" : "Icon: white"));
+                    if (hov) using (Brush hb = new SolidBrush(Color.FromArgb(34, 255, 255, 255))) g.FillRectangle(hb, it.R);
+                    using (Pen p = new Pen(Color.FromArgb(150, 150, 150), Math.Max(1f, S)))
+                    {
+                        p.Alignment = PenAlignment.Inset;
+                        g.DrawRectangle(p, it.R.X, it.R.Y, it.R.Width - 1, it.R.Height - 1);
+                    }
+                    TextRenderer.DrawText(g, label, fBar, it.R, Color.White,
+                        TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
+                }
+            }
         }
 
         // --------------------------------------------------------------- popup menu ---
@@ -1421,7 +1990,7 @@ namespace Win8Charms
             m.Add(new PopItem("Shut down", true, delegate { Dismiss(); PowerOps.ShutDown(); }));
             m.Add(new PopItem("Restart", true, delegate { Dismiss(); PowerOps.Restart(); }));
             m.Add(new PopItem("Sign out", true, delegate { Dismiss(); PowerOps.SignOut(); }));
-            ShowMenu(m, rcSearch.Right + (int)Math.Round(4 * S), rcPower.Bottom + (int)Math.Round(20 * S));
+            ShowMenu(m, rcPower.Right + (int)Math.Round(4 * S), rcPower.Bottom + (int)Math.Round(20 * S));
         }
 
         void OpenUserMenu()
@@ -1437,7 +2006,6 @@ namespace Win8Charms
         int HeaderHit(Point p)
         {
             int s = (int)Math.Round(8 * S);
-            if (Rectangle.Inflate(rcSearch, s, s).Contains(p)) return HDR_SEARCH;
             if (Rectangle.Inflate(rcPower, s, s).Contains(p)) return HDR_POWER;
             if (rcAvatar.Contains(p)) return HDR_AVATAR;
             if (rcToggle.Contains(p)) return HDR_TOGGLE;
@@ -1448,7 +2016,6 @@ namespace Win8Charms
         {
             switch (kind)
             {
-                case HDR_SEARCH: Dismiss(); Actions.Run(0); break;
                 case HDR_POWER: OpenPowerMenu(); break;
                 case HDR_AVATAR: OpenUserMenu(); break;
                 case HDR_TOGGLE: SetMode(!allMode); break;
@@ -1458,7 +2025,8 @@ namespace Win8Charms
         void SetMode(bool apps)
         {
             allMode = apps;
-            selected = null;
+            editOpen = false;
+            sel.Clear();
             barTarget = 0;
             scrollX = 0;
             scrollT = 0;
@@ -1489,12 +2057,13 @@ namespace Win8Charms
             base.OnMouseDown(e);
             Point p = e.Location;
             if (menu != null) { if (!rcMenu.Contains(p)) CloseMenu(); return; }
+            if (editOpen) { if (!rcEdit.Contains(p)) CloseEdit(); return; }
 
             if (e.Button == MouseButtons.Right)
             {
                 if (InBar(p)) return;
                 Cell rc = HitCell(p);
-                if (rc != null) SelectCell(rc); else Deselect();
+                if (rc != null) ToggleSel(rc); else Deselect();
                 return;
             }
             if (e.Button != MouseButtons.Left) return;
@@ -1536,14 +2105,18 @@ namespace Win8Charms
                     {
                         dragging = true;
                         dragOff = new Point(pressPt.X + (int)Math.Round(scrollX) - pressCell.R.X, pressPt.Y - pressCell.R.Y);
-                        if (selected != null) Deselect();
+                        if (sel.Count > 0) Deselect();
                     }
                 }
                 if (dragging)
                 {
                     dragPt = p;
+                    int edge = (int)Math.Round(80 * S);
+                    if (p.X > W - edge) ScrollBy(40 * S);
+                    else if (p.X < edge) ScrollBy(-40 * S);
                     Cell t = HitCell(p);
                     dropTarget = (t == pressCell) ? null : t;
+                    if (dropTarget == null) ComputeSlot(p); else slotOn = false;
                     Invalidate();
                     return;
                 }
@@ -1552,6 +2125,12 @@ namespace Win8Charms
             {
                 int mh = MenuHit(p);
                 if (mh != menuHover) { menuHover = mh; Invalidate(rcMenu); }
+                return;
+            }
+            if (editOpen)
+            {
+                int eh = EditHit(p);
+                if (eh != editHover) { editHover = eh; Invalidate(rcEdit); }
                 return;
             }
             int bh = InBar(p) ? BarHit(p) : -1;
@@ -1587,6 +2166,11 @@ namespace Win8Charms
             }
             if (e.Button != MouseButtons.Left) return;
 
+            if (editOpen)
+            {
+                if (e.Button == MouseButtons.Left) EditClick(EditHit(p));
+                return;
+            }
             if (thumbDrag) { thumbDrag = false; Invalidate(); return; }
             if (barPress >= 0)
             {
@@ -1616,20 +2200,37 @@ namespace Win8Charms
                 if (dragging)
                 {
                     dragging = false;
-                    Cell t = dropTarget;
                     dropTarget = null;
-                    if (t != null && !allMode && pc.Pin != null && t.Pin != null)
+                    slotOn = false;
+                    Cell t = HitCell(p);
+                    if (t == pc) t = null;
+                    if (!allMode && pc.Pin != null)
                     {
-                        PinStore.Move(pc.Pin, t.Pin);
-                        PinStore.Save();
-                        Relayout();
+                        if (t != null && t.Pin != null)
+                        {
+                            PinStore.Move(pc.Pin, t.Pin);           // dropped on a tile: goes into that tile's group
+                            PinStore.Save();
+                            Relayout();
+                        }
+                        else if (t == null)
+                        {
+                            ComputeSlot(p);                          // dropped on empty space: new group
+                            if (slotOn)
+                            {
+                                PinStore.MoveToNewGroup(pc.Pin, slotBefore);
+                                PinStore.Save();
+                                slotOn = false;
+                                Relayout();
+                            }
+                        }
                     }
                     Invalidate();
                     return;
                 }
                 if (HitCell(p) == pc)
                 {
-                    if (selected != null) { if (selected == pc) Deselect(); else SelectCell(pc); }
+                    // while something is selected (or Ctrl is held) a click toggles the tile instead of launching it
+                    if (sel.Count > 0 || (ModifierKeys & Keys.Control) != 0) ToggleSel(pc);
                     else LaunchCell(pc);
                 }
                 else InvalidateCell(pc);
@@ -1639,7 +2240,7 @@ namespace Win8Charms
         protected override void OnMouseWheel(MouseEventArgs e)
         {
             base.OnMouseWheel(e);
-            if (menu != null) return;
+            if (menu != null || editOpen) return;
             ScrollBy(-e.Delta / 120.0 * 256 * S);
         }
 
@@ -1651,7 +2252,8 @@ namespace Win8Charms
                 {
                     case Keys.Escape:
                         if (menu != null) CloseMenu();
-                        else if (selected != null) Deselect();
+                        else if (editOpen) CloseEdit();
+                        else if (sel.Count > 0) Deselect();
                         else if (allMode) SetMode(false);
                         else Dismiss();
                         return true;
